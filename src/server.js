@@ -39,10 +39,29 @@ app.use(cookieParser())
 app.use(express.json())
 
 const allowedOrigin = frontendOrigin.replace(/\/$/, '')
+const extraOrigins = String(process.env.FRONTEND_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim().replace(/\/$/, ''))
+  .filter(Boolean)
+const corsAllowed = [...new Set([allowedOrigin, ...extraOrigins])]
+
+/** API host (e.g. skyport-core.vercel.app) vs FRONTEND_ORIGIN host → cross-origin fetch needs SameSite=None session cookies */
+let frontendHost = ''
+try {
+  frontendHost = new URL(allowedOrigin).hostname
+} catch (_) {}
+const coreHost = (process.env.VERCEL_URL || '').replace(/^https?:\/\//, '').split('/')[0] || ''
+const crossSiteSession =
+  String(process.env.SESSION_CROSS_SITE || '') === '1' ||
+  Boolean(coreHost && frontendHost && coreHost !== frontendHost)
 
 app.use(
   cors({
-    origin: allowedOrigin,
+    origin(origin, cb) {
+      if (!origin) return cb(null, true)
+      if (corsAllowed.includes(origin)) return cb(null, origin)
+      cb(null, false)
+    },
     credentials: true,
   })
 )
@@ -67,10 +86,15 @@ const COOKIE = 'skyport_session'
 const STATE_COOKIE = 'skyport_oauth_state'
 const RETURN_COOKIE = 'skyport_return_to'
 
-/** Must match on set + clear or browsers keep the session cookie. */
-const SESSION_COOKIE = {
+/** Session cookie: lax+insecure on localhost; none+secure when frontend and API are on different hosts (e.g. Vercel). */
+const SESSION_COOKIE = crossSiteSession
+  ? { httpOnly: true, secure: true, sameSite: 'none', path: '/' }
+  : { httpOnly: true, secure: false, sameSite: 'lax', path: '/' }
+
+/** OAuth state lives only on Core top-level navigations → Lax is enough. */
+const STATE_COOKIE_OPTS = {
   httpOnly: true,
-  secure: false,
+  secure: crossSiteSession,
   sameSite: 'lax',
   path: '/',
 }
@@ -115,20 +139,8 @@ app.get('/auth/login', (req, res) => {
   }
   const returnTo = String(req.query.returnTo || '/').slice(0, 2048)
   const state = crypto.randomBytes(24).toString('hex')
-  res.cookie(STATE_COOKIE, state, {
-    httpOnly: true,
-    secure: false,
-    sameSite: 'lax',
-    maxAge: 600000,
-    path: '/',
-  })
-  res.cookie(RETURN_COOKIE, returnTo, {
-    httpOnly: true,
-    secure: false,
-    sameSite: 'lax',
-    maxAge: 600000,
-    path: '/',
-  })
+  res.cookie(STATE_COOKIE, state, { ...STATE_COOKIE_OPTS, maxAge: 600000 })
+  res.cookie(RETURN_COOKIE, returnTo, { ...STATE_COOKIE_OPTS, maxAge: 600000 })
   const params = new URLSearchParams({
     client_id: clientId,
     response_type: 'code',
@@ -159,8 +171,10 @@ app.get('/oauth/callback', async (req, res) => {
   const { code, state, error, error_description: errDesc } = req.query
   const savedState = req.cookies[STATE_COOKIE]
   const returnTo = req.cookies[RETURN_COOKIE] || '/'
-  res.clearCookie(STATE_COOKIE, { path: '/' })
-  res.clearCookie(RETURN_COOKIE, { path: '/' })
+  res.clearCookie(STATE_COOKIE, STATE_COOKIE_OPTS)
+  res.clearCookie(RETURN_COOKIE, STATE_COOKIE_OPTS)
+  res.cookie(STATE_COOKIE, '', { ...STATE_COOKIE_OPTS, maxAge: 0, expires: new Date(0) })
+  res.cookie(RETURN_COOKIE, '', { ...STATE_COOKIE_OPTS, maxAge: 0, expires: new Date(0) })
 
   if (error) {
     return res.redirect(
@@ -235,7 +249,7 @@ app.listen(Number(PORT), () => {
   console.log(`Skyport-Core listening on http://localhost:${PORT}`)
   console.log(`Register Web redirect URI: ${redirectUri || '(set OAUTH_REDIRECT_URI)'}`)
   console.log(
-    `[env] clientId=${Boolean(clientId)} clientSecret=${hasSecret} redirectUri=${Boolean(redirectUri)} sessionSecret=${Boolean(sessionSecret)}`
+    `[env] clientId=${Boolean(clientId)} clientSecret=${hasSecret} redirectUri=${Boolean(redirectUri)} sessionSecret=${Boolean(sessionSecret)} crossSiteSession=${crossSiteSession}`
   )
   if (!hasSecret) {
     console.warn(
