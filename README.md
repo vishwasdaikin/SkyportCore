@@ -2,7 +2,7 @@
 
 OAuth2 (Microsoft Entra **Web** client) + session API for [Skyport-Web](https://github.com/vishwasdaikin/SkyportHome).
 
-**Live:** [skyport-core.vercel.app](https://skyport-core.vercel.app) (example)
+**Production:** [skyport-core.vercel.app](https://skyport-core.vercel.app) · **Web:** [skyport-home.vercel.app](https://skyport-home.vercel.app) · URL matrix: Skyport-Web `docs/VERCEL_URLS.md`
 
 ## Vercel environment variables
 
