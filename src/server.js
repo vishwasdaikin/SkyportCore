@@ -248,6 +248,7 @@ app.post('/auth/logout', (_req, res) => {
 })
 
 app.get('/auth/logout', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
   clearSessionCookie(res)
   res.redirect(302, allowedOrigin)
 })
