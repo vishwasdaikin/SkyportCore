@@ -29,6 +29,7 @@ const {
   AUTH_MICROSOFT_ENTRA_ID_SECRET: clientSecret,
   AUTH_MICROSOFT_ENTRA_ID_TENANT: tenant,
   OAUTH_REDIRECT_URI: redirectUri,
+  OAUTH_PROMPT: oauthPromptEnv,
   FRONTEND_ORIGIN: frontendOrigin = 'http://localhost:5173',
   SESSION_SECRET: sessionSecret,
   PORT = '3001',
@@ -166,6 +167,13 @@ app.get('/auth/login', (req, res) => {
     scope: 'openid profile email offline_access',
     state,
   })
+  const allowedPrompt = new Set(['login', 'select_account', 'none', 'consent'])
+  const qPrompt = String(req.query.prompt || '').trim()
+  if (allowedPrompt.has(qPrompt)) {
+    params.set('prompt', qPrompt)
+  } else if (oauthPromptEnv && allowedPrompt.has(String(oauthPromptEnv).trim())) {
+    params.set('prompt', String(oauthPromptEnv).trim())
+  }
   res.redirect(`${tenantBase()}/oauth2/v2.0/authorize?${params}`)
 })
 
