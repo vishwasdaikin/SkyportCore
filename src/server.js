@@ -66,9 +66,26 @@ app.use(
   })
 )
 
+/**
+ * Vercel often has the full issuer URL pasted here — that produced
+ * login.microsoftonline.com/https://login.microsoftonline.com/.../v2.0 → 404.
+ * Accept tenant GUID, or full issuer URL; always emit a single authority host.
+ */
+function normalizeTenantId(raw) {
+  const s = String(raw || 'common').trim()
+  if (!s) return 'common'
+  const lower = s.toLowerCase()
+  if (lower === 'common' || lower === 'organizations' || lower === 'consumers') {
+    return lower
+  }
+  const m = s.match(/login\.microsoftonline\.com\/([^/?#]+)/i)
+  if (m) return m[1].replace(/\/v2\.0$/i, '')
+  if (/^[a-f0-9-]{36}$/i.test(s)) return s
+  return s
+}
+
 function tenantBase() {
-  const t = (tenant || 'common').trim()
-  return `https://login.microsoftonline.com/${t}`
+  return `https://login.microsoftonline.com/${normalizeTenantId(tenant)}`
 }
 
 function requireConfig(res) {
