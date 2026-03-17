@@ -118,11 +118,24 @@ const STATE_COOKIE_OPTS = {
 }
 
 function clearSessionCookie(res) {
-  res.clearCookie(COOKIE, SESSION_COOKIE)
-  res.cookie(COOKIE, '', {
-    ...SESSION_COOKIE,
-    maxAge: 0,
-    expires: new Date(0),
+  const o = { ...SESSION_COOKIE, path: '/' }
+  res.clearCookie(COOKIE, o)
+  res.cookie(COOKIE, '', { ...o, maxAge: 0, expires: new Date(0) })
+  if (crossSiteSession) {
+    res.append(
+      'Set-Cookie',
+      `${COOKIE}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=None`
+    )
+  }
+}
+
+function noStoreHeaders(res) {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'CDN-Cache-Control': 'no-store',
+    'Vercel-CDN-Cache-Control': 'no-store',
   })
 }
 
@@ -242,15 +255,22 @@ app.get('/oauth/callback', async (req, res) => {
   res.redirect(`${allowedOrigin}${path.startsWith('/') ? path : `/${path}`}`)
 })
 
-app.post('/auth/logout', (_req, res) => {
+/**
+ * Primary logout: browser POST (form from web app). Full navigation processes
+ * Set-Cookie reliably; 303 back to web. GET /auth/logout is still supported
+ * but can be CDN-cached on some edges — prefer POST.
+ */
+app.post('/auth/logout', (req, res) => {
+  noStoreHeaders(res)
   clearSessionCookie(res)
-  res.json({ ok: true })
+  const next = `${allowedOrigin.replace(/\/$/, '')}/?signed_out=1`
+  res.redirect(303, next)
 })
 
 app.get('/auth/logout', (_req, res) => {
-  res.setHeader('Cache-Control', 'no-store')
+  noStoreHeaders(res)
   clearSessionCookie(res)
-  res.redirect(302, allowedOrigin)
+  res.redirect(302, `${allowedOrigin.replace(/\/$/, '')}/?signed_out=1`)
 })
 
 app.get('/auth/me', async (req, res) => {
