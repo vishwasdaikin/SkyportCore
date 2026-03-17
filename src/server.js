@@ -1,0 +1,245 @@
+/**
+ * Skyport-Core: OAuth2 auth code flow (Web client) + session cookie.
+ * Redirect URI must be registered in Azure as Web (not SPA).
+ * Frontend uses Vite proxy: same-origin /api/* → this server so Set-Cookie works on :5173.
+ */
+import express from 'express'
+import cors from 'cors'
+import cookieParser from 'cookie-parser'
+import crypto from 'crypto'
+import * as jose from 'jose'
+import dotenv from 'dotenv'
+import { dirname, join } from 'path'
+import { fileURLToPath } from 'url'
+
+// Load .env, then .env.local — only non-empty .env.local keys override (empty lines won’t wipe .env secrets).
+const coreRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+dotenv.config({ path: join(coreRoot, '.env') })
+const localEnv = dotenv.config({ path: join(coreRoot, '.env.local') })
+if (localEnv.parsed) {
+  for (const [key, value] of Object.entries(localEnv.parsed)) {
+    if (value != null && String(value).trim() !== '') {
+      process.env[key] = String(value).trim()
+    }
+  }
+}
+
+const {
+  AUTH_MICROSOFT_ENTRA_ID_ID: clientId,
+  AUTH_MICROSOFT_ENTRA_ID_SECRET: clientSecret,
+  AUTH_MICROSOFT_ENTRA_ID_TENANT: tenant,
+  OAUTH_REDIRECT_URI: redirectUri,
+  FRONTEND_ORIGIN: frontendOrigin = 'http://localhost:5173',
+  SESSION_SECRET: sessionSecret,
+  PORT = '3001',
+} = process.env
+
+const app = express()
+app.use(cookieParser())
+app.use(express.json())
+
+const allowedOrigin = frontendOrigin.replace(/\/$/, '')
+
+app.use(
+  cors({
+    origin: allowedOrigin,
+    credentials: true,
+  })
+)
+
+function tenantBase() {
+  const t = (tenant || 'common').trim()
+  return `https://login.microsoftonline.com/${t}`
+}
+
+function requireConfig(res) {
+  if (!clientId || !clientSecret || !redirectUri || !sessionSecret) {
+    res.status(500).json({
+      error:
+        'Missing env: AUTH_MICROSOFT_ENTRA_ID_ID, AUTH_MICROSOFT_ENTRA_ID_SECRET, OAUTH_REDIRECT_URI, SESSION_SECRET',
+    })
+    return false
+  }
+  return true
+}
+
+const COOKIE = 'skyport_session'
+const STATE_COOKIE = 'skyport_oauth_state'
+const RETURN_COOKIE = 'skyport_return_to'
+
+/** Must match on set + clear or browsers keep the session cookie. */
+const SESSION_COOKIE = {
+  httpOnly: true,
+  secure: false,
+  sameSite: 'lax',
+  path: '/',
+}
+
+function clearSessionCookie(res) {
+  res.clearCookie(COOKIE, SESSION_COOKIE)
+  res.cookie(COOKIE, '', {
+    ...SESSION_COOKIE,
+    maxAge: 0,
+    expires: new Date(0),
+  })
+}
+
+const secretKey = () =>
+  new TextEncoder().encode(sessionSecret || 'dev-only-change-me-min-32-chars!!')
+
+async function signSession(payload) {
+  return new jose.SignJWT({ ...payload })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('7d')
+    .sign(secretKey())
+}
+
+async function verifySession(token) {
+  try {
+    const { payload } = await jose.jwtVerify(token, secretKey())
+    return payload
+  } catch {
+    return null
+  }
+}
+
+/** Start login → redirect to Microsoft (redirect to app with message if .env.local incomplete — avoids blank JSON page) */
+app.get('/auth/login', (req, res) => {
+  if (!clientId || !String(clientSecret || '').trim() || !redirectUri || !sessionSecret) {
+    const msg =
+      'Skyport-Core needs AUTH_MICROSOFT_ENTRA_ID_SECRET in .env or .env.local (plus ID, tenant, OAUTH_REDIRECT_URI, SESSION_SECRET). Restart Core after edits.'
+    return res.redirect(
+      `${allowedOrigin}/?skyport_core_setup=1&msg=${encodeURIComponent(msg)}`
+    )
+  }
+  const returnTo = String(req.query.returnTo || '/').slice(0, 2048)
+  const state = crypto.randomBytes(24).toString('hex')
+  res.cookie(STATE_COOKIE, state, {
+    httpOnly: true,
+    secure: false,
+    sameSite: 'lax',
+    maxAge: 600000,
+    path: '/',
+  })
+  res.cookie(RETURN_COOKIE, returnTo, {
+    httpOnly: true,
+    secure: false,
+    sameSite: 'lax',
+    maxAge: 600000,
+    path: '/',
+  })
+  const params = new URLSearchParams({
+    client_id: clientId,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    response_mode: 'query',
+    scope: 'openid profile email offline_access',
+    state,
+  })
+  res.redirect(`${tenantBase()}/oauth2/v2.0/authorize?${params}`)
+})
+
+function idTokenClaims(idToken) {
+  if (!idToken || typeof idToken !== 'string') return { sub: 'user', name: '', email: '' }
+  const parts = idToken.split('.')
+  if (parts.length < 2) return { sub: 'user', name: '', email: '' }
+  const json = Buffer.from(parts[1], 'base64url').toString('utf8')
+  const p = JSON.parse(json)
+  return {
+    sub: p.sub || p.oid || 'user',
+    name: p.name || '',
+    email: p.email || p.preferred_username || '',
+  }
+}
+
+/** OAuth callback (Web redirect URI) */
+app.get('/oauth/callback', async (req, res) => {
+  if (!requireConfig(res)) return
+  const { code, state, error, error_description: errDesc } = req.query
+  const savedState = req.cookies[STATE_COOKIE]
+  const returnTo = req.cookies[RETURN_COOKIE] || '/'
+  res.clearCookie(STATE_COOKIE, { path: '/' })
+  res.clearCookie(RETURN_COOKIE, { path: '/' })
+
+  if (error) {
+    return res.redirect(
+      `${allowedOrigin}/?auth_error=${encodeURIComponent(String(error))}&detail=${encodeURIComponent(String(errDesc || ''))}`
+    )
+  }
+  if (!code || !state || state !== savedState) {
+    return res.redirect(`${allowedOrigin}/?auth_error=invalid_oauth_state`)
+  }
+
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    code: String(code),
+    redirect_uri: redirectUri,
+    grant_type: 'authorization_code',
+    scope: 'openid profile email offline_access',
+  })
+
+  const tokenRes = await fetch(`${tenantBase()}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  })
+  const tokenJson = await tokenRes.json().catch(() => ({}))
+  if (!tokenRes.ok) {
+    return res.redirect(
+      `${allowedOrigin}/?auth_error=token_exchange&detail=${encodeURIComponent(JSON.stringify(tokenJson))}`
+    )
+  }
+
+  const claims = idTokenClaims(tokenJson.id_token)
+
+  const jwt = await signSession(claims)
+  res.cookie(COOKIE, jwt, {
+    ...SESSION_COOKIE,
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  })
+  const path = returnTo.startsWith('http') ? '/' : returnTo
+  res.redirect(`${allowedOrigin}${path.startsWith('/') ? path : `/${path}`}`)
+})
+
+app.post('/auth/logout', (_req, res) => {
+  clearSessionCookie(res)
+  res.json({ ok: true })
+})
+
+app.get('/auth/logout', (_req, res) => {
+  clearSessionCookie(res)
+  res.redirect(302, allowedOrigin)
+})
+
+app.get('/auth/me', async (req, res) => {
+  const token = req.cookies[COOKIE]
+  if (!token) return res.status(401).json({ authenticated: false })
+  const payload = await verifySession(token)
+  if (!payload) return res.status(401).json({ authenticated: false })
+  res.json({
+    authenticated: true,
+    user: {
+      sub: payload.sub,
+      name: payload.name,
+      email: payload.email,
+    },
+  })
+})
+
+app.get('/health', (_req, res) => res.json({ ok: true }))
+
+app.listen(Number(PORT), () => {
+  const hasSecret = Boolean(clientSecret && String(clientSecret).trim())
+  console.log(`Skyport-Core listening on http://localhost:${PORT}`)
+  console.log(`Register Web redirect URI: ${redirectUri || '(set OAUTH_REDIRECT_URI)'}`)
+  console.log(
+    `[env] clientId=${Boolean(clientId)} clientSecret=${hasSecret} redirectUri=${Boolean(redirectUri)} sessionSecret=${Boolean(sessionSecret)}`
+  )
+  if (!hasSecret) {
+    console.warn(
+      '[env] Put AUTH_MICROSOFT_ENTRA_ID_SECRET in Skyport-Core/.env or .env.local, then restart.'
+    )
+  }
+})
