@@ -13,6 +13,13 @@
       "headers": [
         { "key": "Cache-Control", "value": "no-store, no-cache, must-revalidate, private" }
       ]
+    },
+    {
+      "source": "/smartsheet/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-store, no-cache, must-revalidate, private" },
+        { "key": "CDN-Cache-Control", "value": "no-store" }
+      ]
     }
   ]
 }

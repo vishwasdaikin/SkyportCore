@@ -290,6 +290,59 @@ app.get('/auth/me', async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
+/**
+ * Proxy Smartsheet sheet JSON (server holds token).
+ * Manual: SMARTSHEET_ACCESS_TOKEN=… SMARTSHEET_SHEET_ID=… curl -sS http://localhost:3001/smartsheet/sheet | head
+ */
+app.get('/smartsheet/sheet', async (_req, res) => {
+  noStoreHeaders(res)
+  const accessToken = String(process.env.SMARTSHEET_ACCESS_TOKEN || '').trim()
+  const sheetId = String(process.env.SMARTSHEET_SHEET_ID || '').trim()
+  if (!accessToken || !sheetId) {
+    return res.status(503).json({
+      error: true,
+      status: 503,
+      message: 'Smartsheet is not configured (missing SMARTSHEET_ACCESS_TOKEN or SMARTSHEET_SHEET_ID)',
+    })
+  }
+
+  const url = `https://api.smartsheet.com/2.0/sheets/${encodeURIComponent(sheetId)}`
+  let upstream
+  try {
+    upstream = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Network error'
+    return res.status(502).json({ error: true, status: 502, message: msg })
+  }
+
+  const text = await upstream.text()
+  if (upstream.ok) {
+    res.type('application/json')
+    return res.status(200).send(text)
+  }
+
+  let message = `Smartsheet returned HTTP ${upstream.status}`
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed.message === 'string' && parsed.message.length > 0) {
+      message = parsed.message.slice(0, 500)
+    }
+  } catch {
+    // ignore — use generic message
+  }
+  return res.status(upstream.status >= 400 && upstream.status < 600 ? upstream.status : 502).json({
+    error: true,
+    status: upstream.status,
+    message,
+  })
+})
+
 app.listen(Number(PORT), () => {
   const hasSecret = Boolean(clientSecret && String(clientSecret).trim())
   console.log(`Skyport-Core listening on http://localhost:${PORT}`)
