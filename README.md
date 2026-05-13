@@ -12,6 +12,8 @@ OAuth2 (Microsoft Entra **Web** client) + session API for [Skyport-Web](https://
 | `FRONTEND_ORIGIN` | Skyport-Web URL (CORS + post-login redirect) |
 | `FRONTEND_ORIGINS` | Optional comma-separated extra web origins |
 | `AUTH_*`, `SESSION_SECRET` | See `.env.example` |
+| `OAUTH_ALLOWED_MICROSOFT_EMAIL_DOMAINS` | Optional comma-separated allowlist (e.g. `daikincomfort.com`). Empty = any email. |
+| `OAUTH_ADMIN_EMAILS` | Optional comma-separated emails that get `role=admin` in the session payload. |
 
 Azure **Web** redirect URI must match `OAUTH_REDIRECT_URI` exactly.
 
