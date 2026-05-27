@@ -46,6 +46,38 @@ const extraOrigins = String(process.env.FRONTEND_ORIGINS || '')
   .filter(Boolean)
 const corsAllowed = [...new Set([allowedOrigin, ...extraOrigins])]
 
+/**
+ * Sign-in policy ported from the former NextAuth sso-app (auth.ts):
+ * - Restrict Microsoft sign-in by email domain.
+ * - Mark known emails as `admin` in the session payload (others get `editor`).
+ * Empty `OAUTH_ALLOWED_MICROSOFT_EMAIL_DOMAINS` = no allowlist (any email accepted).
+ */
+const allowedDomains = String(process.env.OAUTH_ALLOWED_MICROSOFT_EMAIL_DOMAINS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase().replace(/^@/, ''))
+  .filter(Boolean)
+const adminEmails = new Set(
+  String(process.env.OAUTH_ADMIN_EMAILS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+)
+
+function emailDomain(email) {
+  if (!email || typeof email !== 'string') return ''
+  const at = email.lastIndexOf('@')
+  return at >= 0 ? email.slice(at + 1).toLowerCase() : ''
+}
+
+function isEmailAllowed(email) {
+  if (allowedDomains.length === 0) return true
+  return allowedDomains.includes(emailDomain(email))
+}
+
+function roleForEmail(email) {
+  return email && adminEmails.has(String(email).toLowerCase()) ? 'admin' : 'editor'
+}
+
 /** API host (e.g. skyport-core.vercel.app) vs FRONTEND_ORIGIN host → cross-origin fetch needs SameSite=None session cookies */
 let frontendHost = ''
 try {
@@ -246,7 +278,15 @@ app.get('/oauth/callback', async (req, res) => {
 
   const claims = idTokenClaims(tokenJson.id_token)
 
-  const jwt = await signSession(claims)
+  if (!isEmailAllowed(claims.email)) {
+    clearSessionCookie(res)
+    const detail = `email_domain_not_allowed: ${emailDomain(claims.email) || '(no email)'}; allowed: ${allowedDomains.join(',') || '(none configured)'}`
+    return res.redirect(
+      `${allowedOrigin}/?auth_error=access_denied&detail=${encodeURIComponent(detail)}`
+    )
+  }
+
+  const jwt = await signSession({ ...claims, role: roleForEmail(claims.email) })
   res.cookie(COOKIE, jwt, {
     ...SESSION_COOKIE,
     maxAge: 7 * 24 * 60 * 60 * 1000,
@@ -284,6 +324,7 @@ app.get('/auth/me', async (req, res) => {
       sub: payload.sub,
       name: payload.name,
       email: payload.email,
+      role: payload.role || 'editor',
     },
   })
 })
@@ -349,6 +390,9 @@ app.listen(Number(PORT), () => {
   console.log(`Register Web redirect URI: ${redirectUri || '(set OAUTH_REDIRECT_URI)'}`)
   console.log(
     `[env] clientId=${Boolean(clientId)} clientSecret=${hasSecret} redirectUri=${Boolean(redirectUri)} sessionSecret=${Boolean(sessionSecret)} crossSiteSession=${crossSiteSession}`
+  )
+  console.log(
+    `[policy] allowedDomains=${allowedDomains.join(',') || '(none — any email accepted)'} adminEmails=${adminEmails.size}`
   )
   if (!hasSecret) {
     console.warn(
