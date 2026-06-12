@@ -22,3 +22,14 @@ When the API host ≠ frontend host, the server uses `SameSite=None` session coo
 ## Frontend
 
 Set `VITE_API_BASE_URL=https://<this-core-host>` on the web project. See Skyport-Web `docs/VERCEL_DEPLOY.md`.
+
+Behavioral notes for the SPA (cross-repo contract) live in [docs/FRONTEND_HANDOFF.md](docs/FRONTEND_HANDOFF.md).
+
+## Deployment / ops follow-up
+
+`vercel.json` currently only sets cache-control headers; it has no `rewrites`, `functions`,
+or `builds`. A plain Express `app.listen` server does not run as a Vercel serverless function
+without a builder/rewrite (or a `api/` entrypoint). Confirm how routes are served in
+production (the cache headers in `vercel.json` only apply if requests actually hit this app),
+and that `NODE_ENV=production` plus the required env vars (incl. a 32+ char `SESSION_SECRET`
+and a tenant GUID) are set — the server now exits at boot if they are missing/weak.

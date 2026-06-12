@@ -5,6 +5,8 @@
  */
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
+import rateLimit from 'express-rate-limit'
 import cookieParser from 'cookie-parser'
 import crypto from 'crypto'
 import * as jose from 'jose'
@@ -35,9 +37,31 @@ const {
   PORT = '3001',
 } = process.env
 
+const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production'
+const allowAnyEmail = String(process.env.OAUTH_ALLOW_ANY_EMAIL || '') === '1'
+
 const app = express()
+// Behind Vercel/other proxies so express-rate-limit + secure cookies see the real client + scheme.
+app.set('trust proxy', 1)
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+        baseUri: ["'none'"],
+        formAction: ["'self'"],
+      },
+    },
+    referrerPolicy: { policy: 'no-referrer' },
+    hsts: { maxAge: 15552000, includeSubDomains: true },
+    // API is consumed cross-origin by the SPA via credentialed fetch; don't let CORP block it.
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+)
 app.use(cookieParser())
-app.use(express.json())
+app.use(express.json({ limit: '64kb' }))
 
 const allowedOrigin = frontendOrigin.replace(/\/$/, '')
 const extraOrigins = String(process.env.FRONTEND_ORIGINS || '')
@@ -50,7 +74,8 @@ const corsAllowed = [...new Set([allowedOrigin, ...extraOrigins])]
  * Sign-in policy ported from the former NextAuth sso-app (auth.ts):
  * - Restrict Microsoft sign-in by email domain.
  * - Mark known emails as `admin` in the session payload (others get `editor`).
- * Empty `OAUTH_ALLOWED_MICROSOFT_EMAIL_DOMAINS` = no allowlist (any email accepted).
+ * Empty `OAUTH_ALLOWED_MICROSOFT_EMAIL_DOMAINS` = no allowlist. In production this fails
+ * CLOSED (no sign-in) unless OAUTH_ALLOW_ANY_EMAIL=1 is set explicitly.
  */
 const allowedDomains = String(process.env.OAUTH_ALLOWED_MICROSOFT_EMAIL_DOMAINS || '')
   .split(',')
@@ -70,7 +95,10 @@ function emailDomain(email) {
 }
 
 function isEmailAllowed(email) {
-  if (allowedDomains.length === 0) return true
+  if (allowedDomains.length === 0) {
+    // Default-open is only permitted outside production, or with an explicit opt-in.
+    return !isProd || allowAnyEmail
+  }
   return allowedDomains.includes(emailDomain(email))
 }
 
@@ -99,6 +127,19 @@ app.use(
   })
 )
 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+})
+const smartsheetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+})
+
 /**
  * Vercel often has the full issuer URL pasted here — that produced
  * login.microsoftonline.com/https://login.microsoftonline.com/.../v2.0 → 404.
@@ -117,9 +158,17 @@ function normalizeTenantId(raw) {
   return s
 }
 
+const normalizedTenant = normalizeTenantId(tenant)
+const isGuidTenant = /^[a-f0-9-]{36}$/i.test(normalizedTenant)
+
 function tenantBase() {
-  return `https://login.microsoftonline.com/${normalizeTenantId(tenant)}`
+  return `https://login.microsoftonline.com/${normalizedTenant}`
 }
+
+/** JWKS for verifying Microsoft-issued ID tokens; jose caches keys internally. */
+const idTokenJwks = jose.createRemoteJWKSet(
+  new URL(`${tenantBase()}/discovery/v2.0/keys`)
+)
 
 function requireConfig(res) {
   if (!clientId || !clientSecret || !redirectUri || !sessionSecret) {
@@ -135,16 +184,36 @@ function requireConfig(res) {
 const COOKIE = 'skyport_session'
 const STATE_COOKIE = 'skyport_oauth_state'
 const RETURN_COOKIE = 'skyport_return_to'
+const NONCE_COOKIE = 'skyport_oauth_nonce'
+const PKCE_COOKIE = 'skyport_oauth_verifier'
 
-/** Session cookie: lax+insecure on localhost; none+secure when frontend and API are on different hosts (e.g. Vercel). */
-const SESSION_COOKIE = crossSiteSession
-  ? { httpOnly: true, secure: true, sameSite: 'none', path: '/' }
-  : { httpOnly: true, secure: false, sameSite: 'lax', path: '/' }
+/** Session lifetime — shortened from 7d; stateless JWTs can't be revoked, so keep TTL tight. */
+function parseTtlSeconds(raw) {
+  const s = String(raw || '8h').trim()
+  const m = s.match(/^(\d+)\s*([smhd])?$/i)
+  if (!m) return 8 * 3600
+  const n = Number(m[1])
+  const u = (m[2] || 's').toLowerCase()
+  const mult = u === 's' ? 1 : u === 'm' ? 60 : u === 'h' ? 3600 : 86400
+  return n * mult
+}
+const sessionTtlSeconds = parseTtlSeconds(process.env.SESSION_TTL)
 
-/** OAuth state lives only on Core top-level navigations → Lax is enough. */
-const STATE_COOKIE_OPTS = {
+/**
+ * Session cookie: lax+insecure only on localhost dev; Secure is forced in production and
+ * whenever the cookie must travel cross-site (SameSite=None requires Secure).
+ */
+const SESSION_COOKIE = {
   httpOnly: true,
-  secure: crossSiteSession,
+  secure: isProd || crossSiteSession,
+  sameSite: crossSiteSession ? 'none' : 'lax',
+  path: '/',
+}
+
+/** Short-lived OAuth handshake cookies (state/nonce/pkce/return) — Lax is enough for top-level redirects. */
+const HANDSHAKE_COOKIE_OPTS = {
+  httpOnly: true,
+  secure: isProd || crossSiteSession,
   sameSite: 'lax',
   path: '/',
 }
@@ -161,6 +230,11 @@ function clearSessionCookie(res) {
   }
 }
 
+function clearHandshakeCookie(res, name) {
+  res.clearCookie(name, HANDSHAKE_COOKIE_OPTS)
+  res.cookie(name, '', { ...HANDSHAKE_COOKIE_OPTS, maxAge: 0, expires: new Date(0) })
+}
+
 function noStoreHeaders(res) {
   res.set({
     'Cache-Control': 'no-store, no-cache, must-revalidate, private',
@@ -171,28 +245,72 @@ function noStoreHeaders(res) {
   })
 }
 
-const secretKey = () =>
-  new TextEncoder().encode(sessionSecret || 'dev-only-change-me-min-32-chars!!')
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a == null ? '' : a))
+  const bb = Buffer.from(String(b == null ? '' : b))
+  if (ba.length !== bb.length) return false
+  return crypto.timingSafeEqual(ba, bb)
+}
+
+/** Reject state-changing requests whose Origin/Referer is not an allowed frontend (CSRF defense for SameSite=None). */
+function isAllowedRequestOrigin(req) {
+  const origin = req.get('origin')
+  if (origin) return corsAllowed.includes(origin.replace(/\/$/, ''))
+  const referer = req.get('referer')
+  if (referer) return corsAllowed.some((a) => referer === a || referer.startsWith(a + '/'))
+  // No Origin/Referer (some same-origin form posts / non-browser clients) — allow.
+  return true
+}
+
+const secretKey = () => {
+  if (!sessionSecret) throw new Error('SESSION_SECRET is not set')
+  return new TextEncoder().encode(sessionSecret)
+}
 
 async function signSession(payload) {
   return new jose.SignJWT({ ...payload })
     .setProtectedHeader({ alg: 'HS256' })
+    .setJti(crypto.randomUUID())
     .setIssuedAt()
-    .setExpirationTime('7d')
+    .setExpirationTime(`${sessionTtlSeconds}s`)
     .sign(secretKey())
 }
 
 async function verifySession(token) {
   try {
-    const { payload } = await jose.jwtVerify(token, secretKey())
+    const { payload } = await jose.jwtVerify(token, secretKey(), { algorithms: ['HS256'] })
     return payload
   } catch {
     return null
   }
 }
 
+/** Centralized guard: validates the session cookie and attaches req.user. */
+async function requireAuth(req, res, next) {
+  const token = req.cookies[COOKIE]
+  if (!token) return res.status(401).json({ authenticated: false })
+  const payload = await verifySession(token)
+  if (!payload) return res.status(401).json({ authenticated: false })
+  req.user = {
+    sub: payload.sub,
+    name: payload.name,
+    email: payload.email,
+    role: payload.role || 'editor',
+  }
+  next()
+}
+
+/** Role guard for privileged routes (returns 403 on mismatch). Use after requireAuth. */
+function requireRole(role) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ authenticated: false })
+    if (req.user.role !== role) return res.status(403).json({ error: 'forbidden' })
+    next()
+  }
+}
+
 /** Start login → redirect to Microsoft (redirect to app with message if .env.local incomplete — avoids blank JSON page) */
-app.get('/auth/login', (req, res) => {
+app.get('/auth/login', authLimiter, (req, res) => {
   if (!clientId || !String(clientSecret || '').trim() || !redirectUri || !sessionSecret) {
     const msg =
       'Skyport-Core needs AUTH_MICROSOFT_ENTRA_ID_SECRET in .env or .env.local (plus ID, tenant, OAUTH_REDIRECT_URI, SESSION_SECRET). Restart Core after edits.'
@@ -202,8 +320,15 @@ app.get('/auth/login', (req, res) => {
   }
   const returnTo = String(req.query.returnTo || '/').slice(0, 2048)
   const state = crypto.randomBytes(24).toString('hex')
-  res.cookie(STATE_COOKIE, state, { ...STATE_COOKIE_OPTS, maxAge: 600000 })
-  res.cookie(RETURN_COOKIE, returnTo, { ...STATE_COOKIE_OPTS, maxAge: 600000 })
+  const nonce = crypto.randomBytes(24).toString('hex')
+  const codeVerifier = crypto.randomBytes(32).toString('base64url')
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url')
+
+  res.cookie(STATE_COOKIE, state, { ...HANDSHAKE_COOKIE_OPTS, maxAge: 600000 })
+  res.cookie(NONCE_COOKIE, nonce, { ...HANDSHAKE_COOKIE_OPTS, maxAge: 600000 })
+  res.cookie(PKCE_COOKIE, codeVerifier, { ...HANDSHAKE_COOKIE_OPTS, maxAge: 600000 })
+  res.cookie(RETURN_COOKIE, returnTo, { ...HANDSHAKE_COOKIE_OPTS, maxAge: 600000 })
+
   const params = new URLSearchParams({
     client_id: clientId,
     response_type: 'code',
@@ -211,6 +336,9 @@ app.get('/auth/login', (req, res) => {
     response_mode: 'query',
     scope: 'openid profile email offline_access',
     state,
+    nonce,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
   })
   const allowedPrompt = new Set(['login', 'select_account', 'none', 'consent'])
   const qPrompt = String(req.query.prompt || '').trim()
@@ -222,86 +350,109 @@ app.get('/auth/login', (req, res) => {
   res.redirect(`${tenantBase()}/oauth2/v2.0/authorize?${params}`)
 })
 
-function idTokenClaims(idToken) {
-  if (!idToken || typeof idToken !== 'string') return { sub: 'user', name: '', email: '' }
-  const parts = idToken.split('.')
-  if (parts.length < 2) return { sub: 'user', name: '', email: '' }
-  const json = Buffer.from(parts[1], 'base64url').toString('utf8')
-  const p = JSON.parse(json)
+/** Verify the Microsoft ID token signature + claims (sig via JWKS, aud, exp, nonce, iss for GUID tenants). */
+async function verifyIdToken(idToken, expectedNonce) {
+  const { payload } = await jose.jwtVerify(idToken, idTokenJwks, {
+    audience: clientId,
+    ...(isGuidTenant ? { issuer: `${tenantBase()}/v2.0` } : {}),
+  })
+  if (!expectedNonce || !safeEqual(payload.nonce, expectedNonce)) {
+    throw new Error('nonce_mismatch')
+  }
   return {
-    sub: p.sub || p.oid || 'user',
-    name: p.name || '',
-    email: p.email || p.preferred_username || '',
+    sub: payload.sub || payload.oid || 'user',
+    name: payload.name || '',
+    email: payload.email || payload.preferred_username || '',
   }
 }
 
 /** OAuth callback (Web redirect URI) */
-app.get('/oauth/callback', async (req, res) => {
+app.get('/oauth/callback', authLimiter, async (req, res) => {
   if (!requireConfig(res)) return
+  noStoreHeaders(res)
   const { code, state, error, error_description: errDesc } = req.query
   const savedState = req.cookies[STATE_COOKIE]
+  const savedNonce = req.cookies[NONCE_COOKIE]
+  const codeVerifier = req.cookies[PKCE_COOKIE]
   const returnTo = req.cookies[RETURN_COOKIE] || '/'
-  res.clearCookie(STATE_COOKIE, STATE_COOKIE_OPTS)
-  res.clearCookie(RETURN_COOKIE, STATE_COOKIE_OPTS)
-  res.cookie(STATE_COOKIE, '', { ...STATE_COOKIE_OPTS, maxAge: 0, expires: new Date(0) })
-  res.cookie(RETURN_COOKIE, '', { ...STATE_COOKIE_OPTS, maxAge: 0, expires: new Date(0) })
+  for (const name of [STATE_COOKIE, NONCE_COOKIE, PKCE_COOKIE, RETURN_COOKIE]) {
+    clearHandshakeCookie(res, name)
+  }
 
   if (error) {
     return res.redirect(
       `${allowedOrigin}/?auth_error=${encodeURIComponent(String(error))}&detail=${encodeURIComponent(String(errDesc || ''))}`
     )
   }
-  if (!code || !state || state !== savedState) {
+  if (!code || !state || !savedState || !safeEqual(String(state), savedState)) {
     return res.redirect(`${allowedOrigin}/?auth_error=invalid_oauth_state`)
   }
 
-  const body = new URLSearchParams({
-    client_id: clientId,
-    client_secret: clientSecret,
-    code: String(code),
-    redirect_uri: redirectUri,
-    grant_type: 'authorization_code',
-    scope: 'openid profile email offline_access',
-  })
+  try {
+    const body = new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      code: String(code),
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+      scope: 'openid profile email offline_access',
+    })
+    if (codeVerifier) body.set('code_verifier', codeVerifier)
 
-  const tokenRes = await fetch(`${tenantBase()}/oauth2/v2.0/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  })
-  const tokenJson = await tokenRes.json().catch(() => ({}))
-  if (!tokenRes.ok) {
-    return res.redirect(
-      `${allowedOrigin}/?auth_error=token_exchange&detail=${encodeURIComponent(JSON.stringify(tokenJson))}`
-    )
+    const tokenRes = await fetch(`${tenantBase()}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    })
+    const tokenJson = await tokenRes.json().catch(() => ({}))
+    if (!tokenRes.ok) {
+      // Don't leak upstream token-endpoint internals into the redirect URL.
+      console.error('[oauth] token exchange failed', tokenRes.status, tokenJson)
+      return res.redirect(`${allowedOrigin}/?auth_error=token_exchange`)
+    }
+
+    let claims
+    try {
+      claims = await verifyIdToken(tokenJson.id_token, savedNonce)
+    } catch (err) {
+      console.error('[oauth] id_token verification failed:', err?.message || err)
+      return res.redirect(`${allowedOrigin}/?auth_error=invalid_id_token`)
+    }
+
+    if (!isEmailAllowed(claims.email)) {
+      clearSessionCookie(res)
+      const detail =
+        allowedDomains.length === 0
+          ? 'sign_in_policy_not_configured'
+          : `email_domain_not_allowed: ${emailDomain(claims.email) || '(no email)'}; allowed: ${allowedDomains.join(',')}`
+      return res.redirect(
+        `${allowedOrigin}/?auth_error=access_denied&detail=${encodeURIComponent(detail)}`
+      )
+    }
+
+    const jwt = await signSession({ ...claims, role: roleForEmail(claims.email) })
+    res.cookie(COOKIE, jwt, {
+      ...SESSION_COOKIE,
+      maxAge: sessionTtlSeconds * 1000,
+    })
+    const path = returnTo.startsWith('http') ? '/' : returnTo
+    res.redirect(`${allowedOrigin}${path.startsWith('/') ? path : `/${path}`}`)
+  } catch (err) {
+    console.error('[oauth] callback error:', err?.message || err)
+    return res.redirect(`${allowedOrigin}/?auth_error=server_error`)
   }
-
-  const claims = idTokenClaims(tokenJson.id_token)
-
-  if (!isEmailAllowed(claims.email)) {
-    clearSessionCookie(res)
-    const detail = `email_domain_not_allowed: ${emailDomain(claims.email) || '(no email)'}; allowed: ${allowedDomains.join(',') || '(none configured)'}`
-    return res.redirect(
-      `${allowedOrigin}/?auth_error=access_denied&detail=${encodeURIComponent(detail)}`
-    )
-  }
-
-  const jwt = await signSession({ ...claims, role: roleForEmail(claims.email) })
-  res.cookie(COOKIE, jwt, {
-    ...SESSION_COOKIE,
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  })
-  const path = returnTo.startsWith('http') ? '/' : returnTo
-  res.redirect(`${allowedOrigin}${path.startsWith('/') ? path : `/${path}`}`)
 })
 
 /**
  * Primary logout: browser POST (form from web app). Full navigation processes
- * Set-Cookie reliably; 303 back to web. GET /auth/logout is still supported
- * but can be CDN-cached on some edges — prefer POST.
+ * Set-Cookie reliably; 303 back to web. GET is intentionally not supported
+ * (CDN-cacheable + CSRF-able) — the SPA must POST.
  */
 app.post('/auth/logout', (req, res) => {
   noStoreHeaders(res)
+  if (!isAllowedRequestOrigin(req)) {
+    return res.status(403).json({ error: 'forbidden_origin' })
+  }
   clearSessionCookie(res)
   const next = `${allowedOrigin.replace(/\/$/, '')}/?signed_out=1`
   res.redirect(303, next)
@@ -309,33 +460,22 @@ app.post('/auth/logout', (req, res) => {
 
 app.get('/auth/logout', (_req, res) => {
   noStoreHeaders(res)
-  clearSessionCookie(res)
-  res.redirect(302, `${allowedOrigin.replace(/\/$/, '')}/?signed_out=1`)
+  res.set('Allow', 'POST')
+  res.status(405).json({ error: 'method_not_allowed', message: 'Use POST /auth/logout' })
 })
 
-app.get('/auth/me', async (req, res) => {
-  const token = req.cookies[COOKIE]
-  if (!token) return res.status(401).json({ authenticated: false })
-  const payload = await verifySession(token)
-  if (!payload) return res.status(401).json({ authenticated: false })
-  res.json({
-    authenticated: true,
-    user: {
-      sub: payload.sub,
-      name: payload.name,
-      email: payload.email,
-      role: payload.role || 'editor',
-    },
-  })
+app.get('/auth/me', requireAuth, (req, res) => {
+  noStoreHeaders(res)
+  res.json({ authenticated: true, user: req.user })
 })
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
 /**
- * Proxy Smartsheet sheet JSON (server holds token).
+ * Proxy Smartsheet sheet JSON (server holds token). Requires a valid session.
  * Manual: SMARTSHEET_ACCESS_TOKEN=… SMARTSHEET_SHEET_ID=… curl -sS http://localhost:3001/smartsheet/sheet | head
  */
-app.get('/smartsheet/sheet', async (_req, res) => {
+app.get('/smartsheet/sheet', smartsheetLimiter, requireAuth, async (_req, res) => {
   noStoreHeaders(res)
   const accessToken = String(process.env.SMARTSHEET_ACCESS_TOKEN || '').trim()
   const sheetId = String(process.env.SMARTSHEET_SHEET_ID || '').trim()
@@ -384,15 +524,49 @@ app.get('/smartsheet/sheet', async (_req, res) => {
   })
 })
 
+/** Validate required env at boot. Fail fast in production; warn in dev. */
+function validateConfigAtBoot() {
+  const problems = []
+  if (!clientId) problems.push('AUTH_MICROSOFT_ENTRA_ID_ID')
+  if (!clientSecret || !String(clientSecret).trim()) problems.push('AUTH_MICROSOFT_ENTRA_ID_SECRET')
+  if (!redirectUri) problems.push('OAUTH_REDIRECT_URI')
+  if (!sessionSecret) {
+    problems.push('SESSION_SECRET')
+  } else if (String(sessionSecret).length < 32) {
+    problems.push('SESSION_SECRET (must be at least 32 characters)')
+  }
+  if (isProd && allowedDomains.length === 0 && !allowAnyEmail) {
+    problems.push(
+      'OAUTH_ALLOWED_MICROSOFT_EMAIL_DOMAINS (empty in production; set it or OAUTH_ALLOW_ANY_EMAIL=1)'
+    )
+  }
+  if (problems.length) {
+    const msg = `[env] Invalid/missing configuration: ${problems.join(', ')}`
+    if (isProd) {
+      console.error(msg)
+      console.error('[env] Refusing to start in production with invalid auth configuration.')
+      process.exit(1)
+    }
+    console.warn(msg)
+  }
+  if (!isProd && (!normalizedTenant || normalizedTenant === 'common')) {
+    console.warn(
+      '[env] AUTH_MICROSOFT_ENTRA_ID_TENANT is "common" — any Microsoft tenant can sign in. Pin a tenant GUID in production.'
+    )
+  }
+}
+
+validateConfigAtBoot()
+
 app.listen(Number(PORT), () => {
   const hasSecret = Boolean(clientSecret && String(clientSecret).trim())
   console.log(`Skyport-Core listening on http://localhost:${PORT}`)
   console.log(`Register Web redirect URI: ${redirectUri || '(set OAUTH_REDIRECT_URI)'}`)
   console.log(
-    `[env] clientId=${Boolean(clientId)} clientSecret=${hasSecret} redirectUri=${Boolean(redirectUri)} sessionSecret=${Boolean(sessionSecret)} crossSiteSession=${crossSiteSession}`
+    `[env] clientId=${Boolean(clientId)} clientSecret=${hasSecret} redirectUri=${Boolean(redirectUri)} sessionSecret=${Boolean(sessionSecret)} crossSiteSession=${crossSiteSession} sessionTtlSeconds=${sessionTtlSeconds}`
   )
   console.log(
-    `[policy] allowedDomains=${allowedDomains.join(',') || '(none — any email accepted)'} adminEmails=${adminEmails.size}`
+    `[policy] allowedDomains=${allowedDomains.join(',') || '(none)'} adminEmails=${adminEmails.size} allowAnyEmail=${allowAnyEmail} tenant=${normalizedTenant}`
   )
   if (!hasSecret) {
     console.warn(
