@@ -39,6 +39,12 @@ const {
 
 const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production'
 const allowAnyEmail = String(process.env.OAUTH_ALLOW_ANY_EMAIL || '') === '1'
+// On serverless (Vercel/Lambda) a process.exit during cold start becomes an opaque
+// FUNCTION_INVOCATION_FAILED. Detect it so boot validation logs instead of hard-exiting;
+// security still fails closed per-request (requireConfig + the email allowlist).
+const isServerless = Boolean(
+  process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT
+)
 
 const app = express()
 // Behind Vercel/other proxies so express-rate-limit + secure cookies see the real client + scheme.
@@ -542,12 +548,18 @@ function validateConfigAtBoot() {
   }
   if (problems.length) {
     const msg = `[env] Invalid/missing configuration: ${problems.join(', ')}`
-    if (isProd) {
+    if (isProd && !isServerless) {
+      // Standalone process: fail fast so the operator notices immediately.
       console.error(msg)
       console.error('[env] Refusing to start in production with invalid auth configuration.')
       process.exit(1)
+    } else if (isProd) {
+      // Serverless: don't crash the function; auth still fails closed at request time.
+      console.error(msg)
+      console.error('[env] Auth will fail closed until configuration is fixed.')
+    } else {
+      console.warn(msg)
     }
-    console.warn(msg)
   }
   if (!isProd && (!normalizedTenant || normalizedTenant === 'common')) {
     console.warn(
